@@ -1,0 +1,89 @@
+# Hardened self-improvement container image.
+#
+# Based on Dockerfile.sandbox but adds Python 3.12 + Hermes Agent wheel
+# for running the background review / curator fork inside the sandbox.
+#
+# Security properties:
+#   - Non-root UID 65534 (nobody)
+#   - Read-only root filesystem (--read-only Docker flag)
+#   - Explicit tmpfs for /tmp
+#   - No network interface except orchestrator internal bridge
+#   - seccomp profile: deny ptrace, mount, clone-newuser
+#   - AppArmor profile: deny writes outside /hermes-skills/
+#   - Only /hermes-skills/ is writable (skills volume)
+#   - Memory writes are proxied to host via POST /orchestrator/memory-write
+#     (no memory volume mount needed)
+#   - Hermes Agent wheel is read-only (no pip install at runtime)
+
+# ── Stage 1: Build the sandbox_daemon binary ─────────────────────────────────
+FROM rust:1.92-slim AS rust-builder
+
+WORKDIR /build
+
+# Copy workspace manifests and source.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+COPY src/ ./src/
+COPY wit/ ./wit/
+
+# Build the sandbox daemon and the hermes bridge WASM module.
+RUN cargo build --release -p ironclaw \
+    && cargo build --release --target wasm32-wasip1 -p ironclaw_hermes_bridge
+
+# ── Stage 2: Build the Hermes Agent wheel ────────────────────────────────────
+FROM python:3.12-slim AS python-builder
+
+WORKDIR /build
+
+# Install build tools.
+RUN pip install --no-cache-dir build wheel
+
+# Copy Hermes Agent source.
+COPY ../hermes-agent/ ./hermes-agent/
+
+# Build the wheel.
+RUN cd hermes-agent && python -m build --wheel --outdir /dist/
+
+# ── Stage 3: Final hardened image ────────────────────────────────────────────
+FROM python:3.12-slim
+
+# Install the Hermes Agent wheel (read-only at runtime — no pip install).
+COPY --from=python-builder /dist/*.whl /tmp/wheels/
+RUN pip install --no-cache-dir /tmp/wheels/*.whl \
+    && rm -rf /tmp/wheels/ \
+    && pip cache purge
+
+# Copy the sandbox daemon binary.
+COPY --from=rust-builder /build/target/release/ironclaw /usr/local/bin/ironclaw-sandbox
+COPY --from=rust-builder \
+    /build/target/wasm32-wasip1/release/ironclaw_hermes_bridge.wasm \
+    /usr/local/lib/ironclaw/ironclaw_hermes_bridge.wasm
+
+# Create the skills directory (writable volume mount point).
+RUN mkdir -p /hermes-skills && chown 65534:65534 /hermes-skills
+
+# Create tmpfs mount point.
+RUN mkdir -p /tmp && chown 65534:65534 /tmp
+
+# Drop to nobody (UID 65534).
+USER 65534
+
+# Environment variables injected by the orchestrator at container start.
+# These are never baked into the image.
+ENV ORCHESTRATOR_URL=""
+ENV JOB_TOKEN=""
+ENV JOB_ID=""
+ENV JOB_TYPE=""
+ENV SKILLS_VOLUME_PATH="/hermes-skills"
+ENV SELF_IMPROVE_MAX_TURNS="10"
+ENV SELF_IMPROVE_MAX_WALL_SECS="120"
+ENV SELF_IMPROVE_MAX_SKILL_WRITES="10"
+ENV SELF_IMPROVE_MAX_MEMORY_WRITES="5"
+
+# Health check: verify the sandbox daemon is responsive.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -sf http://localhost:8080/health || exit 1
+
+# Entrypoint: the sandbox daemon reads the job config from env and runs
+# the Hermes review fork via the WASM tool bridge.
+ENTRYPOINT ["/usr/local/bin/ironclaw-sandbox", "self-improve"]

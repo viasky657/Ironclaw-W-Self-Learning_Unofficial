@@ -1,0 +1,30 @@
+[package]
+name = "ironclaw_hermes_bridge"
+version = "0.1.0"
+edition = "2024"
+description = "WASM tool bridge for Hermes Agent self-improvement sandbox (skill_manage + memory proxy)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.10"
+base64 = "0.22"
+
+# HTTP client for proxying memory writes to the orchestrator host.
+# Only available in non-WASM builds (the WASM target uses WASI sockets instead).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[features]
+default = []
+# Enable HDC DSV quality gate integration.
+hdc_dsv = []

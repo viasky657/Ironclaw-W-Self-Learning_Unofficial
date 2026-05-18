@@ -1,0 +1,59 @@
+# ironclaw/profiles/local-self-improve.toml
+#
+# Full local stack: libSQL DB + local HDC DSV model + no cloud LLM for self-improvement.
+#
+# This profile enables the complete self-improvement pipeline without any cloud
+# dependencies:
+#   - libSQL embedded database (no PostgreSQL server needed)
+#   - In-process WASM sandbox (no Docker needed)
+#   - Local HDC DSV model server at localhost:8765 (no cloud LLM API calls)
+#
+# Usage:
+#   IRONCLAW_PROFILE=local-self-improve ironclaw
+#
+# Required env vars (not set here — inject via shell or .env):
+#   SELF_IMPROVE_LLM_BASE_URL=http://localhost:8765/v1
+#   SELF_IMPROVE_LLM_MODEL=hdc-dsv-local
+#   HERMES_SECURE_SELF_IMPROVE=true
+#
+# Start the HDC DSV server first:
+#   python hermes-agent/hdc_dsv_server.py
+
+database_backend = "libsql"
+
+[channels]
+gateway_enabled = false
+cli_mode = "tui"
+
+[sandbox]
+# Docker sandbox disabled for local mode.
+# Self-improvement runs in-process with WASM only (wasmtime, same fuel
+# metering + allowlisting as the Docker mode, but no kernel-level isolation).
+enabled = false
+
+[self_improvement]
+enabled = true
+# Route all self-improvement LLM calls to the local HDC DSV server.
+# The server exposes an OpenAI-compatible API at localhost:8765.
+llm_client = "local"
+llm_base_url = "http://localhost:8765/v1"
+llm_model = "hdc-dsv-local"
+
+# HDC DSV quality gate configuration.
+hdc_enabled = true
+hdc_block = true          # Block writes below threshold (not just log)
+hdc_train = true          # Enable online learning after each committed write
+hdc_threshold = 0.4       # Minimum quality score to allow a write
+hdc_bootstrap_min = 50    # Min training examples before gate is active
+
+# Audit log: use the same libSQL DB as the main app.
+audit_backend = "libsql"
+
+# Write limits per job.
+max_turns = 10
+max_wall_secs = 120
+max_skill_writes = 10
+max_memory_writes = 5
+
+# Auto-rollback on safety violation.
+rollback_on_violation = true
