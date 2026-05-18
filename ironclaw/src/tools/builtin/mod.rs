@@ -1,5 +1,7 @@
 //! Built-in tools that come with the agent.
 
+pub mod desktop;
+pub mod desktop_credential_zone;
 mod echo;
 pub mod extension_tools;
 mod file;
@@ -23,6 +25,12 @@ pub mod system;
 mod time;
 mod tool_info;
 
+pub use desktop::{
+    DesktopAccessibilityTreeTool, DesktopClickTool, DesktopKeyPressTool, DesktopOpenAppTool,
+    DesktopScreenshotTool, DesktopSessionStartTool, DesktopSessionStopTool, DesktopTypeTool,
+    build_desktop_tools,
+};
+pub use desktop_credential_zone::DesktopCredentialZoneTool;
 pub use echo::EchoTool;
 pub use extension_tools::{
     ExtensionInfoTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolPermissionSetTool,

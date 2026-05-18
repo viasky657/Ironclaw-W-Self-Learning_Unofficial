@@ -9,8 +9,9 @@
 > See the [Security Scope](#security-scope-what-is-and-is-not-sandboxed) section for the full breakdown
 > and the gap analysis with recommended next steps.
 
-**Plan source:** [`plans/hermes-ironclaw-secure-self-improvement.md`](hermes-ironclaw-secure-self-improvement.md)  
-**Status:** Implemented (all 8 phases)  
+**Plan source:** [`plans/hermes-ironclaw-secure-self-improvement.md`](hermes-ironclaw-secure-self-improvement.md)
+**Rust security hardening:** [`plans/rust-self-improvement-rewrite.md`](rust-self-improvement-rewrite.md)
+**Status:** Implemented (all 8 phases + Rust security hardening)
 **Date:** 2026-05-18
 
 ---
@@ -125,23 +126,144 @@ Rollback Manager (improvement_rollback.py)
 
 ---
 
-#### Hermes Agent — New Python Files
+#### Hermes Agent — Python Files (Rust-backed thin wrappers)
+
+> **Note:** These files were rewritten as thin wrappers in the Rust security hardening phase.
+> Each file tries to import the corresponding Rust PyO3 extension module and falls back to the
+> original Python implementation (renamed to `_*_py.py`) with a security warning if the Rust
+> extension is not built.
 
 | File | Purpose |
 |------|---------|
-| [`hermes-agent/agent/improvement_dispatcher.py`](../hermes-agent/agent/improvement_dispatcher.py) | Main dispatcher. Resolves LLM client (auxiliary/main/local), encrypts conversation snapshot (AES-256-GCM), submits job to IronClaw orchestrator via `POST /jobs/self-improve`. Non-blocking async variant. IronClaw is preferred by default (auto-detected via `GET /health`); `HERMES_SECURE_SELF_IMPROVE` skips the probe; `HERMES_PREFER_LOCAL_SELF_IMPROVE` forces local. |
-| [`hermes-agent/agent/improvement_audit.py`](../hermes-agent/agent/improvement_audit.py) | `SelfImprovementEvent` dataclass + `AuditWriter`. Supports libSQL (local) and orchestrator API (cloud) backends. `record_write_event()` helper. `sha256_hex()` for content hashing. |
-| [`hermes-agent/agent/improvement_rollback.py`](../hermes-agent/agent/improvement_rollback.py) | `RollbackManager` — snapshots before-state, restores in reverse order on failure. Global registry keyed by job_id. `rollback_job()` CLI entry point. Audit-log-based rollback for completed jobs. |
-| [`hermes-agent/agent/ironclaw_tool_bridge.py`](../hermes-agent/agent/ironclaw_tool_bridge.py) | **New.** Routes mutating tool calls (`terminal`, `write_file`, `patch`, `memory`, `skill_manage`, `browser_*`) through the IronClaw sandbox via `POST /worker/{job_id}/tool`. Creates a long-lived tool-session job (`POST /jobs/tool-session`) per agent session. Falls back to direct execution when the orchestrator is unreachable. |
-| [`hermes-agent/hdc_dsv_server.py`](../hermes-agent/hdc_dsv_server.py) | FastAPI OpenAI-compatible server for the HDC DSV model. `HdcDsvModel` class with bag-of-characters hypervector encoding, online bundling, cosine similarity scoring. Endpoints: `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/train`, `GET /health`. Binds to `127.0.0.1:8765` only. Model state persisted to `hdc_model.bin` (0600 permissions). |
+| [`hermes-agent/agent/improvement_dispatcher.py`](../hermes-agent/agent/improvement_dispatcher.py) | **Thin wrapper** → delegates to [`ironclaw_self_improve_dispatcher`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/lib.rs) (Rust PyO3). Falls back to [`_improvement_dispatcher_py.py`](../hermes-agent/agent/_improvement_dispatcher_py.py). Public API unchanged: `trigger_self_improvement`, `trigger_self_improvement_async`, `should_use_ironclaw`, `JOB_TYPE_*` constants. |
+| [`hermes-agent/agent/improvement_audit.py`](../hermes-agent/agent/improvement_audit.py) | **Thin wrapper** → delegates `sha256_hex()` and `record_write_event()` to [`ironclaw_audit_py`](../ironclaw/crates/ironclaw_audit_py/src/lib.rs) (Rust PyO3). `SelfImprovementEvent` dataclass kept as Python DTO. `AuditWriter` delegates DB operations to Rust. |
+| [`hermes-agent/agent/improvement_rollback.py`](../hermes-agent/agent/improvement_rollback.py) | **Thin wrapper** → delegates `RollbackManager` to [`ironclaw_self_improve_dispatcher.PyRollbackManager`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/rollback.rs) (Rust, `zeroize::Zeroizing` on content_before). Falls back to [`_improvement_rollback_py.py`](../hermes-agent/agent/_improvement_rollback_py.py). |
+| [`hermes-agent/agent/ironclaw_tool_bridge.py`](../hermes-agent/agent/ironclaw_tool_bridge.py) | **Thin wrapper** → delegates to [`ironclaw_tool_bridge_rs`](../ironclaw/crates/ironclaw_tool_bridge_rs/src/lib.rs) (Rust PyO3). Compile-time frozen `phf::Set` for sandboxed tool names. Falls back to [`_ironclaw_tool_bridge_py.py`](../hermes-agent/agent/_ironclaw_tool_bridge_py.py). |
+| [`hermes-agent/hdc_dsv_server.py`](../hermes-agent/hdc_dsv_server.py) | **Deprecation shim** → execs `ironclaw-hdc-server` (Rust binary) if found on PATH; otherwise falls back to the Python FastAPI implementation with a deprecation warning. |
+
+#### Hermes Agent — Python Fallback Files (kept during transition)
+
+| File | Purpose |
+|------|---------|
+| [`hermes-agent/agent/_improvement_dispatcher_py.py`](../hermes-agent/agent/_improvement_dispatcher_py.py) | Original Python dispatcher (renamed). Used as fallback when Rust extension not built. |
+| [`hermes-agent/agent/_improvement_rollback_py.py`](../hermes-agent/agent/_improvement_rollback_py.py) | Original Python rollback manager (renamed). Used as fallback. |
+| [`hermes-agent/agent/_ironclaw_tool_bridge_py.py`](../hermes-agent/agent/_ironclaw_tool_bridge_py.py) | Original Python tool bridge (renamed). Used as fallback. |
 
 #### Hermes Agent — Tests
 
 | File | Purpose |
 |------|---------|
-| [`hermes-agent/tests/test_improvement_dispatcher.py`](../hermes-agent/tests/test_improvement_dispatcher.py) | Feature flag, auxiliary/main/local LLM resolution, skip-when-unavailable, no local agent fork, async non-blocking. |
+| [`hermes-agent/tests/test_improvement_dispatcher.py`](../hermes-agent/tests/test_improvement_dispatcher.py) | Feature flag, auxiliary/main/local LLM resolution, skip-when-unavailable, no local agent fork, async non-blocking. Public API compatibility with Rust backend. |
 | [`hermes-agent/tests/test_improvement_audit.py`](../hermes-agent/tests/test_improvement_audit.py) | `sha256_hex`, event dataclass, libSQL backend (insert/query/commit/rollback/immutability), `record_write_event` helper. |
-| [`hermes-agent/tests/test_hdc_dsv_server.py`](../hermes-agent/tests/test_hdc_dsv_server.py) | `HdcDsvModel` scoring/training, persistence (save/load, 0600 permissions), FastAPI endpoints (`/v1/models`, `/v1/chat/completions`, `/v1/train`, `/health`), loopback-only binding. |
+| [`hermes-agent/tests/test_hdc_dsv_server.py`](../hermes-agent/tests/test_hdc_dsv_server.py) | `HdcDsvModel` scoring/training, persistence (save/load, 0600 permissions), FastAPI endpoints (`/v1/models`, `/v1/chat/completions`, `/v1/train`, `/health`), loopback-only binding. Python fallback path. |
+
+---
+
+### Rust Security Hardening — New Crates (Phase 2 of implementation)
+
+> **See:** [`plans/rust-self-improvement-rewrite.md`](rust-self-improvement-rewrite.md) for the full threat model and design rationale.
+
+#### `ironclaw_self_improve_dispatcher` — Rust rewrite of dispatcher + rollback
+
+**Location:** [`ironclaw/crates/ironclaw_self_improve_dispatcher/`](../ironclaw/crates/ironclaw_self_improve_dispatcher/)
+
+| File | Purpose |
+|------|---------|
+| [`Cargo.toml`](../ironclaw/crates/ironclaw_self_improve_dispatcher/Cargo.toml) | `crate-type = ["cdylib", "rlib"]`. Deps: `pyo3`, `aes-gcm`, `ring`, `reqwest`, `serde`, `tokio`, `zeroize`, `thiserror`, `tracing`, `uuid`, `base64`. |
+| [`src/lib.rs`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/lib.rs) | Crate root. `#[pymodule]` entry point. Re-exports all public types. |
+| [`src/types.rs`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/types.rs) | `JobType` enum, `LlmClientMode` enum, `ResolvedLlm`, `EncryptedSnapshot`, `DispatchResult`, `AgentInfo`, `Message`. |
+| [`src/config.rs`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/config.rs) | `DispatcherConfig` — reads all env vars with typed defaults. No `getattr` on Python objects. |
+| [`src/crypto.rs`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/crypto.rs) | `encrypt_snapshot(payload) -> Result<EncryptedSnapshot, CryptoError>`. AES-256-GCM via `aes-gcm` crate. `zeroize::Zeroizing` on key material. **No plaintext fallback.** |
+| [`src/llm_resolver.rs`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/llm_resolver.rs) | `resolve_llm_client(config, agent_info) -> Result<ResolvedLlm, LlmError>`. Typed enum dispatch, no dynamic `getattr` at resolution time. |
+| [`src/orchestrator_client.rs`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/orchestrator_client.rs) | `OrchestratorClient` — `reqwest::Client` with `rustls-tls-native-roots`. Methods: `health_check`, `submit_self_improve_job`, `submit_tool_session`, `execute_sandboxed_tool`, `complete_job`. |
+| [`src/snapshot.rs`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/snapshot.rs) | `build_minimal_snapshot(agent_info, messages) -> serde_json::Value`. Typed struct, no arbitrary dict access. |
+| [`src/rollback.rs`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/rollback.rs) | `RollbackManager` — `Arc<Mutex<Vec<SkillSnapshot>>>`. `zeroize::Zeroizing` on `content_before`. `snapshot_skill`, `commit`, `rollback`. |
+| [`src/dispatcher.rs`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/dispatcher.rs) | `trigger_self_improvement`, `trigger_self_improvement_async`, `should_use_ironclaw`. |
+| [`src/pyo3_bindings.rs`](../ironclaw/crates/ironclaw_self_improve_dispatcher/src/pyo3_bindings.rs) | `PyDispatcherConfig`, `PyAgentInfo`, `PyDispatchResult`, `PyRollbackManager`. `#[pyfunction]` exports. |
+
+#### `ironclaw_tool_bridge_rs` — Rust rewrite of tool bridge
+
+**Location:** [`ironclaw/crates/ironclaw_tool_bridge_rs/`](../ironclaw/crates/ironclaw_tool_bridge_rs/)
+
+| File | Purpose |
+|------|---------|
+| [`Cargo.toml`](../ironclaw/crates/ironclaw_tool_bridge_rs/Cargo.toml) | `crate-type = ["cdylib", "rlib"]`. Deps: `pyo3`, `reqwest`, `serde`, `tokio`, `thiserror`, `tracing`, `uuid`, `dashmap`, `once_cell`, `phf`. |
+| [`src/lib.rs`](../ironclaw/crates/ironclaw_tool_bridge_rs/src/lib.rs) | Crate root. `#[pymodule]` entry point. |
+| [`src/types.rs`](../ironclaw/crates/ironclaw_tool_bridge_rs/src/types.rs) | `ToolBridgeResult` enum: `Ok(String)`, `Fallback`, `Blocked { message }`. |
+| [`src/policy.rs`](../ironclaw/crates/ironclaw_tool_bridge_rs/src/policy.rs) | `SANDBOXED_TOOL_NAMES` — `phf::Set` (compile-time frozen). `is_sandboxed_tool(name) -> bool` — checks set + `browser_` prefix + `mcp__` prefix. |
+| [`src/session.rs`](../ironclaw/crates/ironclaw_tool_bridge_rs/src/session.rs) | `BridgeSession` — `Arc<Mutex<SessionState>>`. `create_job`, `ensure_job`, `execute_tool`, `close`. Fail-closed on all errors after session established. |
+| [`src/registry.rs`](../ironclaw/crates/ironclaw_tool_bridge_rs/src/registry.rs) | `get_or_create_session`, `close_session`, `close_all_sessions`. Global singleton via `once_cell::sync::Lazy<Arc<DashMap<...>>>`. |
+| [`src/pyo3_bindings.rs`](../ironclaw/crates/ironclaw_tool_bridge_rs/src/pyo3_bindings.rs) | `PyToolBridgeResult`. `execute_tool_via_ironclaw_py`, `should_sandbox_tool_py`, `get_or_create_session_py`, `close_session_py`, `close_all_sessions_py`. |
+
+#### `ironclaw_audit_py` — Rust PyO3 bindings for audit SHA-256 + write recording
+
+**Location:** [`ironclaw/crates/ironclaw_audit_py/`](../ironclaw/crates/ironclaw_audit_py/)
+
+| File | Purpose |
+|------|---------|
+| [`Cargo.toml`](../ironclaw/crates/ironclaw_audit_py/Cargo.toml) | `crate-type = ["cdylib"]`. Deps: `pyo3`, `sha2`, `hex`, `tokio`, `reqwest`, `serde_json`, `tracing`. |
+| [`src/lib.rs`](../ironclaw/crates/ironclaw_audit_py/src/lib.rs) | `sha256_hex_py(content) -> str` — `sha2::Sha256`, not patchable from Python. `record_write_event_py(...)` — typed struct, submits to orchestrator API. `mark_committed_py`, `mark_rolled_back_py`. |
+
+#### `ironclaw_hdc_server` — Rust Axum binary replacing `hdc_dsv_server.py`
+
+**Location:** [`ironclaw/crates/ironclaw_hdc_server/`](../ironclaw/crates/ironclaw_hdc_server/)
+
+| File | Purpose |
+|------|---------|
+| [`Cargo.toml`](../ironclaw/crates/ironclaw_hdc_server/Cargo.toml) | `[[bin]]` target `ironclaw-hdc-server`. Deps: `axum`, `tokio`, `serde`, `bincode`, `zeroize`, `sha2`, `subtle`, `tower-http`, `tracing`. |
+| [`src/main.rs`](../ironclaw/crates/ironclaw_hdc_server/src/main.rs) | Axum router. Binds to `127.0.0.1:8765` only (hard-coded). Loads model from `IRONCLAW_HDC_MODEL_PATH`. Graceful shutdown on SIGTERM/SIGINT. |
+| [`src/model.rs`](../ironclaw/crates/ironclaw_hdc_server/src/model.rs) | `HdcDsvModel` — bag-of-characters hypervector encoding. `score`, `train`, `save` (bincode + 0600 perms), `load` (bincode, no pickle). `SharedModel = Arc<RwLock<HdcDsvModel>>`. |
+| [`src/auth.rs`](../ironclaw/crates/ironclaw_hdc_server/src/auth.rs) | `bearer_auth_middleware` — Tower middleware. Reads `IRONCLAW_HDC_SERVER_TOKEN`. Constant-time comparison via `subtle::ConstantTimeEq`. Public: `GET /v1/models`, `GET /health`. Protected: `POST /v1/chat/completions`, `POST /v1/train`. |
+| [`src/handlers.rs`](../ironclaw/crates/ironclaw_hdc_server/src/handlers.rs) | `chat_completions`, `train`, `list_models`, `health`. All return typed `axum::Json<T>`. |
+| [`src/types.rs`](../ironclaw/crates/ironclaw_hdc_server/src/types.rs) | `ChatCompletionRequest/Response`, `TrainRequest/Response`, `ModelsResponse`, `HealthResponse`, `WriteOutcome`. All `#[derive(Serialize, Deserialize)]`. |
+
+#### Rust Integration Tests
+
+| File | What It Tests |
+|------|--------------|
+| [`ironclaw/tests/self_improvement_dispatcher_rs.rs`](../ironclaw/tests/self_improvement_dispatcher_rs.rs) | AES-256-GCM encryption (no plaintext fallback), LLM client resolution (typed enum), snapshot serialization (serde_json), rollback manager (commit/rollback/idempotency/file restore), `DispatchResult` variants, config defaults. |
+| [`ironclaw/tests/tool_bridge_rs.rs`](../ironclaw/tests/tool_bridge_rs.rs) | Sandboxed tool set (compile-time `phf::Set`), fail-closed semantics (blocked not fallback), `ToolBridgeResult` variants, session registry (create/reuse/concurrent). |
+| [`ironclaw/tests/audit_py_bindings.rs`](../ironclaw/tests/audit_py_bindings.rs) | SHA-256 output matches NIST test vectors and Python `hashlib.sha256`, determinism, Unicode content, `mark_committed`/`mark_rolled_back` no-panic on network error. |
+| [`ironclaw/tests/hdc_server_rs.rs`](../ironclaw/tests/hdc_server_rs.rs) | Model scoring/training, bincode save/load roundtrip, pickle data rejected, 0600 permissions (Unix), loopback-only binding (source code assertion), concurrent reads/writes thread safety. |
+
+#### Migration Utility
+
+| File | Purpose |
+|------|---------|
+| [`ironclaw/scripts/migrate_hdc_model.py`](../ironclaw/scripts/migrate_hdc_model.py) | One-time migration: reads old `hdc_model.bin` (Python pickle) and writes a JSON migration file. Run once on upgrade from Python to Rust HDC server. |
+
+---
+
+### Desktop Sandbox — New Files (Phase 3: Safe Desktop App Access)
+
+> **See:** the desktop sandbox architecture section below for the full threat model and design rationale.
+
+#### IronClaw — Desktop Sandbox Core
+
+| File | Purpose |
+|------|---------|
+| [`ironclaw/src/sandbox/desktop.rs`](../ironclaw/src/sandbox/desktop.rs) | `DesktopSandboxManager` — manages a long-lived Docker container running Xvfb (virtual framebuffer). Methods: `start_session(consent)` (consent gate), `stop_session`, `screenshot` (base64 PNG of Xvfb framebuffer, with credential redaction), `click(x, y, button)` (xdotool mouse), `type_text(text)` (xdotool keyboard), `key_press(key)` (X11 keysym), `open_app(name)` (validated app launch), `accessibility_tree(app_filter, max_depth)` (AT-SPI2 → JSON, with credential redaction). `DesktopSandboxConfig` with defaults. `DesktopError` enum. `credential_zones: SharedCredentialZones` field (shared with tools). |
+| [`ironclaw/src/sandbox/credential_zones.rs`](../ironclaw/src/sandbox/credential_zones.rs) | `CredentialZoneConfig` — two-zone credential management. **Hidden zone**: values stored in memory, zeroized on drop; `redact_text()` replaces occurrences with `[HIDDEN]`; `contains_hidden()` for fast checks. **Visible zone**: `CredentialEntry` structs (label, username, password, notes) serialized to JSON for the AI. `redact_accessibility_tree()` recursively redacts JSON trees. `SharedCredentialZones = Arc<RwLock<CredentialZoneConfig>>`. |
+| [`ironclaw/src/sandbox/mod.rs`](../ironclaw/src/sandbox/mod.rs) | Added `pub mod desktop`, `pub mod credential_zones` and re-exports: `DesktopError`, `DesktopExecOutput`, `DesktopResult`, `DesktopSandboxConfig`, `DesktopSandboxManager`, `CredentialEntry`, `CredentialZoneConfig`, `SharedCredentialZones`, `new_shared_zones`, `redact_accessibility_tree`. |
+| [`ironclaw/src/sandbox/config.rs`](../ironclaw/src/sandbox/config.rs) | Added `SandboxPolicy::DesktopAccess` variant. Updated `allows_writes()`, added `is_desktop_access()`, updated `writable_path()` (returns `/workspace`), updated `FromStr` (accepts `desktop_access`, `desktopaccess`, `desktop`). Updated error message to include `desktop_access`. |
+| [`ironclaw/src/config/sandbox.rs`](../ironclaw/src/config/sandbox.rs) | Updated `to_sandbox_config()`: when `policy == DesktopAccess` and the configured image does not contain `"desktop"`, overrides image to `ironclaw-desktop:latest` with an info log. |
+
+#### IronClaw — Desktop Tools
+
+| File | Purpose |
+|------|---------|
+| [`ironclaw/src/tools/builtin/desktop.rs`](../ironclaw/src/tools/builtin/desktop.rs) | Nine desktop tools, all holding `Arc<DesktopSandboxManager>`: `DesktopSessionStartTool` (`ApprovalRequirement::Always` — consent gate), `DesktopSessionStopTool`, `DesktopScreenshotTool` (returns `image_base64` + `format`, hidden credentials blacked out), `DesktopClickTool` (x/y/button), `DesktopTypeTool` (max 4096 chars), `DesktopKeyPressTool` (X11 keysym), `DesktopOpenAppTool` (validated app name), `DesktopAccessibilityTreeTool` (AT-SPI2 JSON, hidden credentials replaced with `[HIDDEN]`), `DesktopCredentialZoneTool` (credential zone management). `build_desktop_tools(manager)` convenience builder — shares `credential_zones` between manager and tool. |
+| [`ironclaw/src/tools/builtin/desktop_credential_zone.rs`](../ironclaw/src/tools/builtin/desktop_credential_zone.rs) | `DesktopCredentialZoneTool` — `ApprovalRequirement::Always`. Actions: `add_hidden` (add value to hidden zone, never echoed back), `clear_hidden` (zeroize all hidden values), `add_visible` (add credential AI can use), `clear_visible`, `list_visible` (labels only, no passwords), `status` (counts only). `sensitive_params: ["value", "password"]` — redacted from logs. |
+| [`ironclaw/src/tools/builtin/mod.rs`](../ironclaw/src/tools/builtin/mod.rs) | Added `pub mod desktop`, `pub mod desktop_credential_zone` and re-exports for all nine desktop tool structs, `build_desktop_tools`, and `DesktopCredentialZoneTool`. |
+
+#### IronClaw — Desktop Container Image
+
+| File | Purpose |
+|------|---------|
+| [`ironclaw/docker/desktop-sandbox.Dockerfile`](../ironclaw/docker/desktop-sandbox.Dockerfile) | Ubuntu 24.04 image. Installs: `xvfb`, `fluxbox`, `x11vnc`, `at-spi2-core`, `xdotool`, `scrot`, `imagemagick`, `tesseract-ocr`, `tesseract-ocr-eng`, `python3-pyatspi`, `firefox`, `libreoffice`, `gedit`. Sets `DISPLAY=:99`. Non-root UID 1000 (`worker`). No host display socket mount. No host clipboard bridge. Copies `desktop-entrypoint.sh`, `desktop-accessibility-query.py`, `desktop-redact-screenshot.py`. |
+| [`ironclaw/docker/desktop-entrypoint.sh`](../ironclaw/docker/desktop-entrypoint.sh) | Container entrypoint. Starts Xvfb `:99` (virtual framebuffer, no host DISPLAY connection), waits for display ready, starts D-Bus session, starts AT-SPI2 bus launcher, starts fluxbox. Keeps container alive for `docker exec` commands. Handles SIGTERM/SIGINT for clean shutdown. |
+| [`ironclaw/docker/desktop-accessibility-query.py`](../ironclaw/docker/desktop-accessibility-query.py) | Python AT-SPI2 query script. Queries accessibility bus and outputs structured JSON (role, name, description, states, text, value, bounds). Password fields (`ROLE_PASSWORD_TEXT`) are automatically redacted to `[REDACTED]`. Max 500 nodes to prevent runaway output. CLI: `--app APP_NAME`, `--max-depth N`. |
+| [`ironclaw/docker/desktop-redact-screenshot.py`](../ironclaw/docker/desktop-redact-screenshot.py) | Screenshot credential redaction script. Uses `tesseract` OCR to locate text regions matching hidden values, then uses `imagemagick convert` to black out those regions with solid rectangles. Hidden values are read from a temp file (never passed as CLI args). Best-effort: unusual fonts may not be caught. CLI: `INPUT.png HIDDEN_VALUES.txt OUTPUT.png`. |
 
 ---
 
@@ -157,9 +279,20 @@ Rollback Manager (improvement_rollback.py)
 | [`ironclaw/src/sandbox/manager.rs`](../ironclaw/src/sandbox/manager.rs) | Added `SandboxManager::execute_in_container()` static method — executes a JSON-RPC tool request inside an existing container via Docker exec. |
 | [`ironclaw/src/error.rs`](../ironclaw/src/error.rs) | Added `OrchestratorError::JobNotFound`, `OrchestratorError::SandboxError`, and `OrchestratorError::Internal` variants. |
 | [`ironclaw/src/db/libsql/mod.rs`](../ironclaw/src/db/libsql/mod.rs) | Added `pub mod self_improvement_audit` and re-exports for `LibSqlAuditRepository`, `SelfImprovementAuditRepository`, `AuditEventStatus`, `AuditEvent`. |
-| [`ironclaw/Cargo.toml`](../ironclaw/Cargo.toml) | Added `crates/ironclaw_hermes_bridge` and `crates/ironclaw_hdc_dsv` to workspace members. |
-| [`ironclaw/.env.example`](../ironclaw/.env.example) | Added all new environment variables (see Configuration section below). |
-| [`hermes-agent/agent/improvement_dispatcher.py`](../hermes-agent/agent/improvement_dispatcher.py) | Added `is_orchestrator_reachable()`, `is_local_self_improve_forced()`, and `should_use_ironclaw()` helpers. `trigger_self_improvement()` now uses `should_use_ironclaw()` instead of the `HERMES_SECURE_SELF_IMPROVE` flag check, so IronClaw is preferred by default whenever the orchestrator is reachable. |
+| [`ironclaw/Cargo.toml`](../ironclaw/Cargo.toml) | Added `crates/ironclaw_hermes_bridge`, `crates/ironclaw_hdc_dsv`, `crates/ironclaw_self_improve_dispatcher`, `crates/ironclaw_tool_bridge_rs`, `crates/ironclaw_audit_py`, `crates/ironclaw_hdc_server` to workspace members. Added `pyo3` (optional), `zeroize`, `bincode`, `dashmap`, `once_cell`, `phf`, `ring` as workspace dependencies. |
+| [`ironclaw/src/sandbox/config.rs`](../ironclaw/src/sandbox/config.rs) | **(Phase 3)** Added `SandboxPolicy::DesktopAccess` variant with full doc comment (security properties, residual risks, consent gate). Updated `allows_writes()`, `writable_path()`, `FromStr`. Added `is_desktop_access()`. |
+| [`ironclaw/src/sandbox/mod.rs`](../ironclaw/src/sandbox/mod.rs) | **(Phase 3)** Added `pub mod desktop`, `pub mod credential_zones`. Re-exports for all desktop sandbox types. |
+| [`ironclaw/src/config/sandbox.rs`](../ironclaw/src/config/sandbox.rs) | **(Phase 3)** `to_sandbox_config()` auto-selects `ironclaw-desktop:latest` image when `policy == DesktopAccess` and no custom desktop image is configured. |
+| [`ironclaw/src/tools/builtin/mod.rs`](../ironclaw/src/tools/builtin/mod.rs) | **(Phase 3)** Added `pub mod desktop`, `pub mod desktop_credential_zone`. Re-exports for all 9 desktop tools and `build_desktop_tools`. |
+| [`ironclaw/src/tools/builtin/desktop.rs`](../ironclaw/src/tools/builtin/desktop.rs) | **(Phase 3)** `build_desktop_tools()` now includes `DesktopCredentialZoneTool` (9 tools total). Shares `credential_zones` between manager and tool. Screenshot and accessibility tree methods apply credential redaction. |
+| [`ironclaw/src/sandbox/desktop.rs`](../ironclaw/src/sandbox/desktop.rs) | **(Phase 3)** Added `credential_zones: SharedCredentialZones` field. `screenshot()` applies tesseract+imagemagick redaction for hidden values. `accessibility_tree()` applies `redact_accessibility_tree()`. Added `shell_escape()` helper. |
+| [`ironclaw/docker/desktop-sandbox.Dockerfile`](../ironclaw/docker/desktop-sandbox.Dockerfile) | **(Phase 3)** Added `tesseract-ocr`, `tesseract-ocr-eng`. Added `COPY` for `desktop-redact-screenshot.py`. |
+| [`ironclaw/.env.example`](../ironclaw/.env.example) | Added all new environment variables including `IRONCLAW_HDC_SERVER_TOKEN` (required for Rust HDC server `/v1/train` auth). |
+| [`hermes-agent/agent/improvement_dispatcher.py`](../hermes-agent/agent/improvement_dispatcher.py) | **Rewritten as thin wrapper** → delegates to `ironclaw_self_improve_dispatcher` Rust PyO3 extension. Falls back to `_improvement_dispatcher_py.py` with security warning. Public API unchanged. |
+| [`hermes-agent/agent/improvement_audit.py`](../hermes-agent/agent/improvement_audit.py) | **Rewritten as thin wrapper** → delegates `sha256_hex()` and `record_write_event()` to `ironclaw_audit_py` Rust extension. `SelfImprovementEvent` kept as Python DTO. |
+| [`hermes-agent/agent/improvement_rollback.py`](../hermes-agent/agent/improvement_rollback.py) | **Rewritten as thin wrapper** → delegates `RollbackManager` to `ironclaw_self_improve_dispatcher.PyRollbackManager` (Rust, `zeroize` on content). Falls back to `_improvement_rollback_py.py`. |
+| [`hermes-agent/agent/ironclaw_tool_bridge.py`](../hermes-agent/agent/ironclaw_tool_bridge.py) | **Rewritten as thin wrapper** → delegates to `ironclaw_tool_bridge_rs` Rust PyO3 extension. Compile-time frozen `phf::Set` for sandboxed tool names. Falls back to `_ironclaw_tool_bridge_py.py`. |
+| [`hermes-agent/hdc_dsv_server.py`](../hermes-agent/hdc_dsv_server.py) | **Deprecation shim added** → execs `ironclaw-hdc-server` Rust binary if found on PATH; otherwise falls back to Python FastAPI implementation with deprecation warning. |
 | [`hermes-agent/agent/conversation_loop.py`](../hermes-agent/agent/conversation_loop.py) | Post-turn background review block now calls `should_use_ironclaw()` and routes through `trigger_self_improvement_async()` whenever IronClaw is available — no longer requires `HERMES_SECURE_SELF_IMPROVE=true`. Falls back to `_spawn_background_review()` only when IronClaw is genuinely unavailable or opted out. |
 | [`hermes-agent/agent/curator.py`](../hermes-agent/agent/curator.py) | `maybe_run_curator()` now calls `should_use_ironclaw()` and dispatches `CURATOR_RUN` to the IronClaw sandbox whenever the orchestrator is reachable — no longer requires `HERMES_SECURE_SELF_IMPROVE=true`. Falls back to `run_curator_review()` only when IronClaw is unavailable or opted out. |
 | [`hermes-agent/agent/tool_executor.py`](../hermes-agent/agent/tool_executor.py) | Both sequential and concurrent tool execution paths now attempt `execute_tool_via_ironclaw()` before falling back to `handle_function_call()` / `_invoke_tool()`. Mutating tools (`terminal`, `write_file`, `patch`, `memory`, `skill_manage`, `browser_*`) are routed through the IronClaw sandbox when the orchestrator is reachable. |
@@ -268,6 +401,101 @@ A complete local stack with zero cloud dependencies:
 - HDC DSV server at `localhost:8765` (no cloud LLM)
 - All data stays on the local machine
 
+### 10. Safe Desktop App Access (`SandboxPolicy::DesktopAccess`)
+
+Desktop app access via virtual display (Xvfb), following the industry-standard architecture used by Anthropic Computer Use, OpenAI, and others.
+
+#### Architecture
+
+```
+Host
+  └── Docker container (ironclaw-desktop:latest)
+        ├── Xvfb :99  — virtual framebuffer (NO connection to host DISPLAY)
+        ├── fluxbox   — minimal window manager
+        ├── Desktop apps (Firefox, LibreOffice, etc.)
+        ├── xdotool   — input injection (mouse/keyboard) inside virtual display only
+        ├── scrot     — screenshot (captures Xvfb framebuffer, not host screen)
+        └── AT-SPI2   — accessibility bus → structured JSON (not raw X events)
+```
+
+#### Security properties
+
+| Risk | Mitigated by | Residual risk |
+|------|-------------|---------------|
+| AI sees host screen | Xvfb virtual display (`:99`, no host DISPLAY) | None — completely isolated |
+| AI reads host files | Container filesystem isolation | None |
+| AI exfiltrates data via network | Domain allowlist proxy | Low — only allowlisted domains |
+| AI reads clipboard | Isolated clipboard (no host bridge) | None |
+| AI sees sensitive content user opens | Cannot prevent | **High** — user must not open secrets |
+| Prompt injection via app UI | Content policy on accessibility tree | Medium — hard to fully prevent |
+| Container escape via X11 | Xvfb has no host X socket | Low — Xvfb is well-isolated |
+
+#### Consent gate
+
+Every desktop session requires **explicit user approval** before starting (`ApprovalRequirement::Always` on `desktop_session_start`). This cannot be bypassed by session auto-approve. The user must acknowledge:
+- The AI will be able to see everything rendered in the virtual display.
+- The AI can inject keyboard and mouse input into the virtual display.
+- The user must not open documents containing secrets in this session.
+
+#### Tools
+
+| Tool | Approval | Description |
+|------|----------|-------------|
+| `desktop_session_start` | **Always** (consent gate) | Start session; `consent: true` required |
+| `desktop_session_stop` | UnlessAutoApproved | Stop session and remove container |
+| `desktop_screenshot` | Never | Capture Xvfb framebuffer as base64 PNG (hidden credentials blacked out) |
+| `desktop_click` | UnlessAutoApproved | Click at (x, y) with mouse button |
+| `desktop_type` | UnlessAutoApproved | Type text (max 4096 chars) |
+| `desktop_key_press` | UnlessAutoApproved | Press X11 keysym (e.g. `ctrl+c`) |
+| `desktop_open_app` | UnlessAutoApproved | Launch app (validated name only) |
+| `desktop_accessibility_tree` | Never | AT-SPI2 tree as JSON (hidden credentials → `[HIDDEN]`) |
+| `desktop_credential_zone` | **Always** | Manage hidden/visible credential zones |
+
+#### Credential zones
+
+Two separate zones allow fine-grained control over what the AI can see:
+
+**Hidden zone** (`add_hidden` action):
+- Values are stored in memory only, never written to disk or logs.
+- Any occurrence in screenshots is blacked out using tesseract OCR + imagemagick.
+- Any occurrence in the accessibility tree is replaced with `[HIDDEN]`.
+- Values are zeroized on drop (`clear_hidden` or session end).
+- The AI is told redaction occurred but never sees the values.
+
+**Visible zone** (`add_visible` action):
+- Credentials the AI is allowed to use (e.g. test accounts, demo logins).
+- Passed to the AI as structured JSON: `{label, username, password, notes}`.
+- NOT redacted from screenshots or accessibility tree.
+- Use for: test account credentials, demo passwords, staging environment logins.
+
+**Example workflow:**
+```
+1. User calls desktop_credential_zone(action="add_hidden", value="my-real-password")
+   → AI will never see "my-real-password" in any screenshot or accessibility tree
+
+2. User calls desktop_credential_zone(action="add_visible", label="Test account",
+                                       username="test@example.com", password="demo123")
+   → AI can see and use "demo123" for the test account
+
+3. AI calls desktop_screenshot() → "my-real-password" is blacked out; "demo123" is visible
+4. AI calls desktop_accessibility_tree() → "my-real-password" → "[HIDDEN]"; "demo123" visible
+```
+
+**Limitations:**
+- Screenshot redaction is best-effort (OCR-based). Unusual fonts may not be caught.
+- Accessibility tree redaction is exact string match — more reliable.
+- Neither prevents inference from context clues.
+
+#### Configuration
+
+Set `SANDBOX_POLICY=desktop_access` (or `desktop`, `desktopaccess`) to enable.
+The image defaults to `ironclaw-desktop:latest`; override with `SANDBOX_IMAGE=my-desktop-image`.
+
+Build the image:
+```bash
+docker build -f ironclaw/docker/desktop-sandbox.Dockerfile -t ironclaw-desktop:latest ironclaw/
+```
+
 ---
 
 ## Workflow: Post-Turn Self-Improvement
@@ -338,12 +566,40 @@ All new environment variables (additive, no breaking changes):
 | `SELF_IMPROVE_HDC_BOOTSTRAP_MIN` | `50` | Min training examples before gate is active |
 | `IRONCLAW_HDC_MODEL_PATH` | `~/.ironclaw/hdc_model.bin` | HDC DSV model state file |
 | `IRONCLAW_HDC_SERVER_URL` | `http://localhost:8765/v1` | HDC DSV server URL |
+| `IRONCLAW_HDC_SERVER_TOKEN` | — | **Required for Rust HDC server.** Bearer token for `POST /v1/train` and `POST /v1/chat/completions`. Generate with `openssl rand -hex 32`. Without this, all write requests return 401. |
 | `IRONCLAW_DB_ENCRYPTION_KEY` | — | libSQL encryption key (auto-generated if unset) |
 | `IRONCLAW_AUDIT_BACKEND` | same as `DATABASE_BACKEND` | Override DB backend for audit log |
 
 ---
 
 ## Quick Start
+
+### Build the Rust Security Extensions (recommended)
+
+The Rust PyO3 extensions and the `ironclaw-hdc-server` binary eliminate the security
+vulnerabilities in the Python fallback implementations. Build them before running Hermes:
+
+```bash
+# Build all four Rust crates
+cd ironclaw
+cargo build --release \
+  -p ironclaw_self_improve_dispatcher \
+  -p ironclaw_tool_bridge_rs \
+  -p ironclaw_audit_py \
+  -p ironclaw_hdc_server
+
+# Install PyO3 extension modules into the Hermes virtualenv
+PYTHON_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])")
+cp target/release/libironclaw_self_improve_dispatcher.so \
+   "${PYTHON_SITE}/ironclaw_self_improve_dispatcher.so"
+cp target/release/libironclaw_tool_bridge_rs.so \
+   "${PYTHON_SITE}/ironclaw_tool_bridge_rs.so"
+cp target/release/libironclaw_audit_py.so \
+   "${PYTHON_SITE}/ironclaw_audit_py.so"
+
+# Verify the extensions are importable
+python3 -c "import ironclaw_self_improve_dispatcher; import ironclaw_tool_bridge_rs; import ironclaw_audit_py; print('Rust extensions OK')"
+```
 
 ### Cloud Mode (Docker + PostgreSQL)
 
@@ -370,8 +626,11 @@ hermes
 ### Local Mode (No Docker, No Cloud)
 
 ```bash
-# 1. Start the HDC DSV model server
-python hermes-agent/hdc_dsv_server.py &
+# 1. Start the Rust HDC DSV server (recommended over Python fallback)
+export IRONCLAW_HDC_SERVER_TOKEN=$(openssl rand -hex 32)
+export IRONCLAW_HDC_MODEL_PATH=~/.ironclaw/hdc_model.bin
+ironclaw-hdc-server &
+# (or: python hermes-agent/hdc_dsv_server.py & — will auto-exec Rust binary if on PATH)
 
 # 2. Set the local profile (IronClaw auto-detected via localhost:8080 health probe)
 export IRONCLAW_PROFILE=local-self-improve
@@ -388,17 +647,71 @@ export SELF_IMPROVE_HDC_TRAIN=true
 hermes
 ```
 
+### Migrating from Python HDC Server to Rust HDC Server
+
+If you have an existing `hdc_model.bin` from the Python server (pickle format):
+
+```bash
+# Run the one-time migration script
+python ironclaw/scripts/migrate_hdc_model.py \
+  --input ~/.ironclaw/hdc_model.bin \
+  --output ~/.ironclaw/hdc_model_migrated.json
+
+# Follow the printed instructions to complete the migration.
+# After verifying the Rust server works, delete the old pickle file:
+rm ~/.ironclaw/hdc_model.bin
+```
+
 ### Running Tests
 
 ```bash
-# Rust tests
+# Rust tests (all new security hardening tests)
 cd ironclaw
+cargo test self_improvement_dispatcher_rs
+cargo test tool_bridge_rs
+cargo test audit_py_bindings
+cargo test hdc_server_rs
+
+# Or run all self-improvement tests at once
 cargo test self_improvement
 
-# Python tests
+# Python tests (public API compatibility — must pass with both Rust and Python backends)
 cd hermes-agent
 pytest tests/test_improvement_dispatcher.py tests/test_improvement_audit.py tests/test_hdc_dsv_server.py -v
 ```
+
+---
+
+## Rust Security Hardening Summary
+
+The following table shows the security properties gained by the Rust rewrite vs the original Python implementation:
+
+| Component | Before (Python) | After (Rust) |
+|-----------|----------------|--------------|
+| **Encryption** | AES-256-GCM **or** base64 fallback if `cryptography` not installed | AES-256-GCM only — hard dependency, no fallback |
+| **Key material in memory** | Python GC, not zeroed | `zeroize::Zeroizing` on drop |
+| **Snapshot deserialization** | `json.loads` + pickle risk in import chain | `serde_json` typed deserialization |
+| **Fail-closed guarantee** | Python import error silently disables bridge | Rust `.so` crash = hard fail, no silent fallback |
+| **Sandboxed tool set** | Runtime `frozenset` (mutable before freeze) | Compile-time `phf::Set` (baked into binary) |
+| **HDC model file format** | Python pickle (RCE on load) | `bincode` typed schema (no code execution on load) |
+| **HDC server auth** | None on `/v1/train` (model poisoning risk) | Bearer token, constant-time comparison (`subtle`) |
+| **SHA-256 hashing** | `hashlib.sha256` (monkey-patchable) | `sha2::Sha256` (not patchable from Python) |
+| **Regex engine** | Python `re` (catastrophic backtracking possible) | Rust `regex` crate (linear-time NFA) |
+| **Thread safety** | Python GIL | `Arc<Mutex<>>` explicit critical sections |
+| **Session registry** | `dict` + `threading.Lock` | `DashMap` (lock-free concurrent HashMap) |
+
+### Threats eliminated by the Rust rewrite
+
+| Threat | Eliminated by |
+|--------|--------------|
+| Prompt injection → host RCE via Python `eval`/`exec` in import chain | Rust binary has no interpreter |
+| Pickle RCE from crafted orchestrator response or `hdc_model.bin` | Rust uses `bincode` with typed deserialization |
+| AES-256-GCM silent fallback to base64 | `aes-gcm` crate is a hard dependency |
+| HDC model poisoning via unauthenticated `POST /v1/train` | Rust server requires bearer token on all write endpoints |
+| SHA-256 hash lying via Python monkey-patching | Hashing moved into Rust `sha2` crate |
+| Fail-closed bypass via Python import error | Rust `.so` import failure is a hard crash |
+| TOCTOU race in snapshot/encrypt path | `Arc<Mutex<>>` with explicit critical sections |
+| Secrets in memory not zeroed | `zeroize::Zeroizing` on key material |
 
 ---
 

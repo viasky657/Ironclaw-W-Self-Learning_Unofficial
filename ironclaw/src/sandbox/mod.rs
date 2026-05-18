@@ -87,6 +87,8 @@
 
 pub mod config;
 pub mod container;
+pub mod credential_zones;
+pub mod desktop;
 pub mod detect;
 pub mod error;
 pub mod manager;
@@ -94,6 +96,13 @@ pub mod proxy;
 
 pub use config::{ResourceLimits, SandboxConfig, SandboxPolicy};
 pub use container::{ContainerOutput, ContainerRunner, connect_docker};
+pub use credential_zones::{
+    CredentialEntry, CredentialZoneConfig, SharedCredentialZones, new_shared_zones,
+    redact_accessibility_tree,
+};
+pub use desktop::{
+    DesktopError, DesktopExecOutput, DesktopResult, DesktopSandboxConfig, DesktopSandboxManager,
+};
 pub use detect::{DockerDetection, DockerStatus, Platform, check_docker};
 pub use error::{Result, SandboxError};
 pub use manager::{ExecOutput, SandboxManager, SandboxManagerBuilder};

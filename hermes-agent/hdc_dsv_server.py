@@ -1,6 +1,28 @@
 #!/usr/bin/env python3
 """HDC DSV (Hyperdimensional Computing Distributed Sparse Vector) local model server.
 
+.. deprecated::
+    This Python implementation is superseded by the Rust ``ironclaw-hdc-server`` binary.
+    The Rust binary provides:
+    - Bearer token authentication on ``/v1/train`` and ``/v1/chat/completions``
+    - ``bincode`` model serialization (replaces Python pickle — no RCE on model load)
+    - Loopback-only binding (127.0.0.1, not configurable)
+    - ``zeroize`` on key material
+
+    To use the Rust binary::
+
+        IRONCLAW_HDC_SERVER_TOKEN=my-secret-token \\
+        IRONCLAW_HDC_MODEL_PATH=~/.ironclaw/hdc_model.bin \\
+        ironclaw-hdc-server
+
+    This file will exec the Rust binary if it is found on PATH.
+    If the Rust binary is not available, it falls back to this Python implementation
+    with a deprecation warning.
+
+----
+
+Original HDC DSV (Hyperdimensional Computing Distributed Sparse Vector) local model server.
+
 Exposes an OpenAI-compatible HTTP API for the HDC DSV model so that IronClaw's
 orchestrator LLM proxy can route self-improvement review calls to the local model
 with zero changes to the proxy code.
@@ -34,6 +56,50 @@ with zero changes to the proxy code.
 - ``IRONCLAW_HDC_DIMENSIONS``: Hypervector dimensions (default: ``10000``)
 - ``IRONCLAW_HDC_SEED``: Random seed for reproducible hypervectors (default: ``42``)
 """
+
+# ---------------------------------------------------------------------------
+# Deprecation shim: exec the Rust binary if available
+# ---------------------------------------------------------------------------
+# This block runs before any other imports so that the Rust binary takes over
+# as early as possible, before fastapi/uvicorn are imported.
+
+import os as _os
+import shutil as _shutil
+import sys as _sys
+import warnings as _warnings
+
+_RUST_BINARY = _shutil.which("ironclaw-hdc-server")
+
+if _RUST_BINARY is not None:
+    _warnings.warn(
+        "hdc_dsv_server.py is deprecated. "
+        "The Rust binary 'ironclaw-hdc-server' was found and will be exec'd instead. "
+        "The Rust binary provides bearer token auth, bincode model serialization "
+        "(no pickle RCE), and loopback-only binding. "
+        "Remove hdc_dsv_server.py from your startup scripts.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
+    # Replace this Python process with the Rust binary.
+    # os.execvp replaces the current process — no return.
+    _os.execvp(_RUST_BINARY, [_RUST_BINARY] + _sys.argv[1:])
+    # If execvp returns (should not happen), fall through to Python implementation.
+
+_warnings.warn(
+    "hdc_dsv_server.py is deprecated and will be removed in a future release. "
+    "Use the Rust binary 'ironclaw-hdc-server' instead. "
+    "Build it with: cd ironclaw && cargo build --release -p ironclaw_hdc_server\n"
+    "Security vulnerabilities in this Python implementation:\n"
+    "  - No authentication on /v1/train (HDC model poisoning risk)\n"
+    "  - Model file uses Python pickle (RCE on load)\n"
+    "  - AES-256-GCM may silently degrade to base64",
+    DeprecationWarning,
+    stacklevel=1,
+)
+
+# ---------------------------------------------------------------------------
+# Python fallback implementation (kept for backward compatibility)
+# ---------------------------------------------------------------------------
 
 from __future__ import annotations
 

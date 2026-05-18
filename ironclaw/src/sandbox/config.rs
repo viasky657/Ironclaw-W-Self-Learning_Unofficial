@@ -58,6 +58,7 @@ impl Default for SandboxConfig {
 /// │ ReadOnly                 │ /workspace (ro)              │ Proxied (allowlist only)       │
 /// │ WorkspaceWrite           │ /workspace (rw)              │ Proxied (allowlist only)       │
 /// │ SelfImprovementWrite     │ /hermes-skills (rw only)     │ Orchestrator bridge only       │
+/// │ DesktopAccess            │ /workspace (rw), /tmp (rw)   │ Proxied (allowlist only)       │
 /// │ FullAccess               │ Full host                    │ Full network (DANGER)          │
 /// └──────────────────────────┴──────────────────────────────┴────────────────────────────────┘
 /// ```
@@ -87,6 +88,30 @@ pub enum SandboxPolicy {
     /// Use for: Hermes background review, curator runs, SWE tasks.
     SelfImprovementWrite,
 
+    /// Desktop app access via virtual display (Xvfb).
+    ///
+    /// **Security properties:**
+    /// - Virtual display: Xvfb `:99` — **no connection to host `DISPLAY`**; the AI
+    ///   cannot see the user's actual screen.
+    /// - Writable surfaces: `/workspace` (rw) and `/tmp` (rw via tmpfs).
+    /// - Network: proxied through the domain allowlist (same as `WorkspaceWrite`).
+    /// - Clipboard: isolated — no host clipboard sharing.
+    /// - Container filesystem: isolated from host (no host mounts beyond `/workspace`).
+    /// - Input injection via `xdotool` inside the container only.
+    /// - Screenshot captures the Xvfb framebuffer, not the host screen.
+    ///
+    /// **Residual risks (user must acknowledge):**
+    /// - The AI sees everything rendered in the virtual display. Do not open
+    ///   documents containing secrets inside the desktop session.
+    /// - Input injection means the AI can type into any field, including
+    ///   password fields rendered in the virtual display.
+    /// - Prompt injection via app UI content is possible; accessibility tree
+    ///   output is sanitised but not fully immune.
+    ///
+    /// Requires explicit user consent before a session starts (consent gate).
+    /// Use for: GUI automation, desktop app testing, browser-based workflows.
+    DesktopAccess,
+
     /// Full access (no sandbox). Use with extreme caution.
     ///
     /// **BLAST RADIUS**: This bypasses Docker entirely and executes commands
@@ -108,6 +133,7 @@ impl SandboxPolicy {
             self,
             SandboxPolicy::WorkspaceWrite
                 | SandboxPolicy::SelfImprovementWrite
+                | SandboxPolicy::DesktopAccess
                 | SandboxPolicy::FullAccess
         )
     }
@@ -127,11 +153,21 @@ impl SandboxPolicy {
         matches!(self, SandboxPolicy::SelfImprovementWrite)
     }
 
+    /// Returns true if this policy enables desktop app access via virtual display.
+    ///
+    /// Desktop sessions run inside a container with Xvfb (virtual framebuffer).
+    /// The AI can see and interact with everything rendered in the virtual display,
+    /// but has **no** access to the host display server.
+    pub fn is_desktop_access(&self) -> bool {
+        matches!(self, SandboxPolicy::DesktopAccess)
+    }
+
     /// Returns the writable path for this policy, if any.
     pub fn writable_path(&self) -> Option<&'static str> {
         match self {
             SandboxPolicy::WorkspaceWrite => Some("/workspace"),
             SandboxPolicy::SelfImprovementWrite => Some("/hermes-skills"),
+            SandboxPolicy::DesktopAccess => Some("/workspace"),
             SandboxPolicy::FullAccess => Some("/"),
             SandboxPolicy::ReadOnly => None,
         }
@@ -148,9 +184,11 @@ impl std::str::FromStr for SandboxPolicy {
             "selfimprovementwrite" | "self_improvement_write" | "self_improve" => {
                 Ok(SandboxPolicy::SelfImprovementWrite)
             }
+            "desktopaccess" | "desktop_access" | "desktop" => Ok(SandboxPolicy::DesktopAccess),
             "fullaccess" | "full_access" | "full" | "none" => Ok(SandboxPolicy::FullAccess),
             _ => Err(format!(
-                "invalid sandbox policy '{}', expected 'readonly', 'workspace_write', 'self_improvement_write', or 'full_access'",
+                "invalid sandbox policy '{}', expected 'readonly', 'workspace_write', \
+                 'self_improvement_write', 'desktop_access', or 'full_access'",
                 s
             )),
         }
@@ -239,6 +277,18 @@ mod tests {
             "full_access".parse::<SandboxPolicy>().unwrap(),
             SandboxPolicy::FullAccess
         );
+        assert_eq!(
+            "desktop_access".parse::<SandboxPolicy>().unwrap(),
+            SandboxPolicy::DesktopAccess
+        );
+        assert_eq!(
+            "desktopaccess".parse::<SandboxPolicy>().unwrap(),
+            SandboxPolicy::DesktopAccess
+        );
+        assert_eq!(
+            "desktop".parse::<SandboxPolicy>().unwrap(),
+            SandboxPolicy::DesktopAccess
+        );
         assert!("invalid".parse::<SandboxPolicy>().is_err());
     }
 
@@ -246,15 +296,45 @@ mod tests {
     fn test_policy_properties() {
         assert!(!SandboxPolicy::ReadOnly.allows_writes());
         assert!(SandboxPolicy::WorkspaceWrite.allows_writes());
+        assert!(SandboxPolicy::DesktopAccess.allows_writes());
         assert!(SandboxPolicy::FullAccess.allows_writes());
 
         assert!(!SandboxPolicy::ReadOnly.has_full_network());
         assert!(!SandboxPolicy::WorkspaceWrite.has_full_network());
+        assert!(!SandboxPolicy::DesktopAccess.has_full_network());
         assert!(SandboxPolicy::FullAccess.has_full_network());
 
         assert!(SandboxPolicy::ReadOnly.is_sandboxed());
         assert!(SandboxPolicy::WorkspaceWrite.is_sandboxed());
+        assert!(SandboxPolicy::DesktopAccess.is_sandboxed());
         assert!(!SandboxPolicy::FullAccess.is_sandboxed());
+    }
+
+    #[test]
+    fn test_desktop_access_policy_properties() {
+        assert!(SandboxPolicy::DesktopAccess.is_desktop_access());
+        assert!(!SandboxPolicy::ReadOnly.is_desktop_access());
+        assert!(!SandboxPolicy::WorkspaceWrite.is_desktop_access());
+        assert!(!SandboxPolicy::SelfImprovementWrite.is_desktop_access());
+        assert!(!SandboxPolicy::FullAccess.is_desktop_access());
+
+        // Desktop access writes to /workspace (same as WorkspaceWrite)
+        assert_eq!(
+            SandboxPolicy::DesktopAccess.writable_path(),
+            Some("/workspace")
+        );
+
+        // Desktop access is NOT self-improvement
+        assert!(!SandboxPolicy::DesktopAccess.is_self_improvement());
+    }
+
+    #[test]
+    fn test_desktop_access_error_message_includes_variant() {
+        let err = "bogus".parse::<SandboxPolicy>().unwrap_err();
+        assert!(
+            err.contains("desktop_access"),
+            "error message should mention desktop_access, got: {err}"
+        );
     }
 
     #[test]

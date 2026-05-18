@@ -1,0 +1,48 @@
+[package]
+name = "ironclaw_self_improve_dispatcher"
+version = "0.1.0"
+edition = "2024"
+description = "Rust rewrite of the Hermes self-improvement dispatcher with AES-256-GCM encryption and typed orchestrator HTTP client"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "ironclaw_self_improve_dispatcher"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# PyO3 Python bindings
+pyo3 = { version = "0.22", features = ["extension-module"] }
+
+# AES-256-GCM encryption (hard dependency — no plaintext fallback)
+aes-gcm = "0.10"
+
+# Cryptographically secure random number generation
+ring = { version = "0.17", features = ["std"] }
+
+# HTTP client with rustls (no OpenSSL dependency)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Zeroize key material on drop
+zeroize = { version = "1", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# Base64 encoding for ciphertext/nonce transport
+base64 = "0.22"
+
+[dev-dependencies]
+tokio-test = "0.4"

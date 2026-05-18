@@ -123,6 +123,10 @@ impl SandboxModeConfig {
     ///
     /// If `policy` is `FullAccess` but `allow_full_access` is `false`,
     /// the policy is downgraded to `WorkspaceWrite` and an error is logged.
+    ///
+    /// If `policy` is `DesktopAccess`, the image is overridden to
+    /// `ironclaw-desktop:latest` (the Xvfb-enabled image) unless the caller
+    /// has already set a custom image that contains "desktop".
     pub fn to_sandbox_config(&self) -> crate::sandbox::SandboxConfig {
         use crate::sandbox::SandboxPolicy;
         use std::time::Duration;
@@ -140,6 +144,21 @@ impl SandboxModeConfig {
             policy = SandboxPolicy::WorkspaceWrite;
         }
 
+        // For DesktopAccess, use the dedicated Xvfb image unless the operator
+        // has already configured a custom image that contains "desktop".
+        let image = if policy == SandboxPolicy::DesktopAccess
+            && !self.image.contains("desktop")
+        {
+            tracing::info!(
+                configured_image = %self.image,
+                "DesktopAccess policy: overriding image to 'ironclaw-desktop:latest'. \
+                 Set SANDBOX_IMAGE to a custom desktop image to suppress this."
+            );
+            "ironclaw-desktop:latest".to_string()
+        } else {
+            self.image.clone()
+        };
+
         let mut allowlist = crate::sandbox::default_allowlist();
         allowlist.extend(self.extra_allowed_domains.clone());
 
@@ -151,7 +170,7 @@ impl SandboxModeConfig {
             memory_limit_mb: self.memory_limit_mb,
             cpu_shares: self.cpu_shares,
             network_allowlist: allowlist,
-            image: self.image.clone(),
+            image,
             auto_pull_image: self.auto_pull_image,
             proxy_port: 0, // Auto-assign
         }

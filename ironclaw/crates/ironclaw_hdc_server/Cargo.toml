@@ -1,0 +1,52 @@
+[package]
+name = "ironclaw_hdc_server"
+version = "0.1.0"
+edition = "2024"
+description = "Rust Axum replacement for hdc_dsv_server.py — requires bearer token auth on write endpoints and uses bincode instead of pickle"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "ironclaw-hdc-server"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server
+axum = { version = "0.7", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Binary serialization for model state (replaces Python pickle)
+bincode = "1"
+
+# Zeroize key material on drop
+zeroize = { version = "1", features = ["derive"] }
+
+# SHA-256 for content hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Constant-time comparison for bearer token validation
+subtle = "2"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+axum-test = "0.5"
+tempfile = "3"
