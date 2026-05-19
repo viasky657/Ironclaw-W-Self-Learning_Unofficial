@@ -112,6 +112,27 @@ pub enum SandboxPolicy {
     /// Use for: GUI automation, desktop app testing, browser-based workflows.
     DesktopAccess,
 
+    /// Audio I/O access via virtual audio device (PulseAudio loopback).
+    ///
+    /// **Security properties:**
+    /// - Virtual audio device: PulseAudio loopback — **no direct hardware access**;
+    ///   the container cannot enumerate or directly open host audio devices.
+    /// - Microphone capture is gated by explicit user consent (consent gate).
+    /// - TTS playback is routed through the PulseAudio virtual sink to host speakers.
+    /// - Container filesystem: isolated from host (no host mounts beyond `/audio-workspace`).
+    /// - Network: proxied through the domain allowlist (same as `WorkspaceWrite`).
+    /// - Audio data is **never written to disk** inside the container unless explicitly requested.
+    ///
+    /// **Residual risks (user must acknowledge):**
+    /// - The AI hears everything captured by the microphone during an active recording.
+    ///   Do not speak sensitive information while a recording is in progress.
+    /// - TTS output is played through the host speakers; bystanders may hear it.
+    /// - Local STT/TTS models may have accuracy limitations.
+    ///
+    /// Requires explicit user consent before a session starts (consent gate).
+    /// Use for: voice commands, dictation, audio feedback, accessibility workflows.
+    AudioAccess,
+
     /// Full access (no sandbox). Use with extreme caution.
     ///
     /// **BLAST RADIUS**: This bypasses Docker entirely and executes commands
@@ -134,6 +155,7 @@ impl SandboxPolicy {
             SandboxPolicy::WorkspaceWrite
                 | SandboxPolicy::SelfImprovementWrite
                 | SandboxPolicy::DesktopAccess
+                | SandboxPolicy::AudioAccess
                 | SandboxPolicy::FullAccess
         )
     }
@@ -162,12 +184,22 @@ impl SandboxPolicy {
         matches!(self, SandboxPolicy::DesktopAccess)
     }
 
+    /// Returns true if this policy enables audio I/O via virtual audio device.
+    ///
+    /// Audio sessions run inside a container with PulseAudio loopback.
+    /// The AI can hear microphone input and play TTS through the host speakers,
+    /// but the container cannot directly access hardware audio devices.
+    pub fn is_audio_access(&self) -> bool {
+        matches!(self, SandboxPolicy::AudioAccess)
+    }
+
     /// Returns the writable path for this policy, if any.
     pub fn writable_path(&self) -> Option<&'static str> {
         match self {
             SandboxPolicy::WorkspaceWrite => Some("/workspace"),
             SandboxPolicy::SelfImprovementWrite => Some("/hermes-skills"),
             SandboxPolicy::DesktopAccess => Some("/workspace"),
+            SandboxPolicy::AudioAccess => Some("/audio-workspace"),
             SandboxPolicy::FullAccess => Some("/"),
             SandboxPolicy::ReadOnly => None,
         }
@@ -185,10 +217,11 @@ impl std::str::FromStr for SandboxPolicy {
                 Ok(SandboxPolicy::SelfImprovementWrite)
             }
             "desktopaccess" | "desktop_access" | "desktop" => Ok(SandboxPolicy::DesktopAccess),
+            "audioaccess" | "audio_access" | "audio" => Ok(SandboxPolicy::AudioAccess),
             "fullaccess" | "full_access" | "full" | "none" => Ok(SandboxPolicy::FullAccess),
             _ => Err(format!(
                 "invalid sandbox policy '{}', expected 'readonly', 'workspace_write', \
-                 'self_improvement_write', 'desktop_access', or 'full_access'",
+                 'self_improvement_write', 'desktop_access', 'audio_access', or 'full_access'",
                 s
             )),
         }
@@ -289,6 +322,18 @@ mod tests {
             "desktop".parse::<SandboxPolicy>().unwrap(),
             SandboxPolicy::DesktopAccess
         );
+        assert_eq!(
+            "audio_access".parse::<SandboxPolicy>().unwrap(),
+            SandboxPolicy::AudioAccess
+        );
+        assert_eq!(
+            "audioaccess".parse::<SandboxPolicy>().unwrap(),
+            SandboxPolicy::AudioAccess
+        );
+        assert_eq!(
+            "audio".parse::<SandboxPolicy>().unwrap(),
+            SandboxPolicy::AudioAccess
+        );
         assert!("invalid".parse::<SandboxPolicy>().is_err());
     }
 
@@ -297,16 +342,19 @@ mod tests {
         assert!(!SandboxPolicy::ReadOnly.allows_writes());
         assert!(SandboxPolicy::WorkspaceWrite.allows_writes());
         assert!(SandboxPolicy::DesktopAccess.allows_writes());
+        assert!(SandboxPolicy::AudioAccess.allows_writes());
         assert!(SandboxPolicy::FullAccess.allows_writes());
 
         assert!(!SandboxPolicy::ReadOnly.has_full_network());
         assert!(!SandboxPolicy::WorkspaceWrite.has_full_network());
         assert!(!SandboxPolicy::DesktopAccess.has_full_network());
+        assert!(!SandboxPolicy::AudioAccess.has_full_network());
         assert!(SandboxPolicy::FullAccess.has_full_network());
 
         assert!(SandboxPolicy::ReadOnly.is_sandboxed());
         assert!(SandboxPolicy::WorkspaceWrite.is_sandboxed());
         assert!(SandboxPolicy::DesktopAccess.is_sandboxed());
+        assert!(SandboxPolicy::AudioAccess.is_sandboxed());
         assert!(!SandboxPolicy::FullAccess.is_sandboxed());
     }
 
@@ -316,6 +364,7 @@ mod tests {
         assert!(!SandboxPolicy::ReadOnly.is_desktop_access());
         assert!(!SandboxPolicy::WorkspaceWrite.is_desktop_access());
         assert!(!SandboxPolicy::SelfImprovementWrite.is_desktop_access());
+        assert!(!SandboxPolicy::AudioAccess.is_desktop_access());
         assert!(!SandboxPolicy::FullAccess.is_desktop_access());
 
         // Desktop access writes to /workspace (same as WorkspaceWrite)
@@ -329,11 +378,40 @@ mod tests {
     }
 
     #[test]
+    fn test_audio_access_policy_properties() {
+        assert!(SandboxPolicy::AudioAccess.is_audio_access());
+        assert!(!SandboxPolicy::ReadOnly.is_audio_access());
+        assert!(!SandboxPolicy::WorkspaceWrite.is_audio_access());
+        assert!(!SandboxPolicy::SelfImprovementWrite.is_audio_access());
+        assert!(!SandboxPolicy::DesktopAccess.is_audio_access());
+        assert!(!SandboxPolicy::FullAccess.is_audio_access());
+
+        // Audio access writes to /audio-workspace
+        assert_eq!(
+            SandboxPolicy::AudioAccess.writable_path(),
+            Some("/audio-workspace")
+        );
+
+        // Audio access is NOT self-improvement or desktop
+        assert!(!SandboxPolicy::AudioAccess.is_self_improvement());
+        assert!(!SandboxPolicy::AudioAccess.is_desktop_access());
+    }
+
+    #[test]
     fn test_desktop_access_error_message_includes_variant() {
         let err = "bogus".parse::<SandboxPolicy>().unwrap_err();
         assert!(
             err.contains("desktop_access"),
             "error message should mention desktop_access, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_audio_access_error_message_includes_variant() {
+        let err = "bogus".parse::<SandboxPolicy>().unwrap_err();
+        assert!(
+            err.contains("audio_access"),
+            "error message should mention audio_access, got: {err}"
         );
     }
 

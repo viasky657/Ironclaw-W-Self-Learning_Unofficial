@@ -1,5 +1,6 @@
 //! Built-in tools that come with the agent.
 
+pub mod audio;
 pub mod desktop;
 pub mod desktop_credential_zone;
 mod echo;
@@ -25,6 +26,10 @@ pub mod system;
 mod time;
 mod tool_info;
 
+pub use audio::{
+    AudioListenTool, AudioRecordTool, AudioSessionStartTool, AudioSessionStopTool,
+    AudioSpeakTool, AudioStatusTool, AudioTranscribeTool, build_audio_tools,
+};
 pub use desktop::{
     DesktopAccessibilityTreeTool, DesktopClickTool, DesktopKeyPressTool, DesktopOpenAppTool,
     DesktopScreenshotTool, DesktopSessionStartTool, DesktopSessionStopTool, DesktopTypeTool,

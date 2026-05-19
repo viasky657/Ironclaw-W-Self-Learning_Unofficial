@@ -11,8 +11,8 @@
 
 **Plan source:** [`plans/hermes-ironclaw-secure-self-improvement.md`](hermes-ironclaw-secure-self-improvement.md)
 **Rust security hardening:** [`plans/rust-self-improvement-rewrite.md`](rust-self-improvement-rewrite.md)
-**Status:** Implemented (all 8 phases + Rust security hardening)
-**Date:** 2026-05-18
+**Status:** Implemented (all 8 phases + Rust security hardening + Audio I/O)
+**Date:** 2026-05-19
 
 ---
 
@@ -848,3 +848,183 @@ To achieve the same level of isolation for regular tool calls as IronClaw provid
 ```
 
 **Bottom line:** Mutating tool calls (`terminal`, `write_file`, `patch`, `memory`, `skill_manage`, `browser_*`, `mcp__*`) are **always** routed through the IronClaw sandbox. If the orchestrator is unreachable, the tool is blocked with a diagnostic error — it is never executed directly on the host. Read-only tools (`read_file`, `grep`, etc.) execute directly with no overhead. There is no opt-out for sandboxed tools.
+
+---
+
+## Audio I/O — Safe Voice Input and Speech Output (`SandboxPolicy::AudioAccess`)
+
+Audio I/O allows the AI agent to accept voice commands via the host microphone and respond with synthesized speech through the host speakers, all routed through an isolated Docker container with a virtual audio device (PulseAudio loopback).
+
+### Architecture
+
+```
+Host
+  └── Docker container (ironclaw-audio:latest)
+        ├── PulseAudio (virtual sink/source — no direct hardware access)
+        ├── ffmpeg / sox  — audio capture, format conversion, normalization
+        ├── whisper.cpp   — local STT (optional; falls back to API)
+        └── piper / espeak-ng — local TTS (optional; falls back to API)
+
+Audio I/O path:
+  Microphone → PulseAudio loopback → container capture → Whisper → transcript
+  Text → TTS engine → PulseAudio loopback → host speakers
+```
+
+### Security properties
+
+| Risk | Mitigated by | Residual risk |
+|------|-------------|---------------|
+| AI accesses host audio hardware directly | PulseAudio loopback (no hardware device enumeration) | None — completely virtualized |
+| AI hears sensitive conversations | Consent gate (`audio_session_start` requires `ApprovalRequirement::Always`) | **Medium** — user must not speak secrets while recording |
+| AI plays malicious audio | TTS output is text-only synthesis; no arbitrary audio file playback | Low |
+| AI exfiltrates data via audio | Container network proxied through domain allowlist | Low |
+| API keys exposed to container | Keys injected by proxy at host boundary, never in container env | None |
+| Container accesses host filesystem | No host mounts beyond `/audio-workspace` (tmpfs) | None |
+
+### Consent gate
+
+Every audio session requires **explicit user approval** before starting (`ApprovalRequirement::Always` on `audio_session_start`). This cannot be bypassed by session auto-approve. The user must acknowledge:
+- The AI will be able to hear everything captured by the microphone.
+- The AI can play audio through the host speakers.
+- The user must not speak sensitive information while recording is active.
+
+### Tools
+
+| Tool | Approval | Description |
+|------|----------|-------------|
+| `audio_session_start` | **Always** (consent gate) | Start session; `consent: true` required |
+| `audio_session_stop` | UnlessAutoApproved | Stop session and remove container |
+| `audio_record` | UnlessAutoApproved | Record audio from microphone (returns base64 WAV) |
+| `audio_transcribe` | Never | Transcribe base64 WAV to text (read-only) |
+| `audio_listen` | UnlessAutoApproved | Record + transcribe in one step |
+| `audio_speak` | UnlessAutoApproved | Synthesize and play speech from text (max 4096 chars) |
+| `audio_status` | Never | Query session status and backend configuration |
+
+### STT backends
+
+| Backend | Description | When to use |
+|---------|-------------|-------------|
+| `whisper_local` (default) | whisper.cpp local inference (base/tiny model) | No API key required; offline; fast for short clips |
+| `whisper_api` | OpenAI Whisper API (`/v1/audio/transcriptions`) | Higher accuracy; requires `OPENAI_API_KEY` |
+| `chat_completions` | OpenAI-compatible chat completions with audio input | Multimodal models (e.g. `gpt-4o-audio-preview`) |
+
+### TTS backends
+
+| Backend | Description | When to use |
+|---------|-------------|-------------|
+| `piper` (default) | Piper local TTS (ONNX neural voices) | No API key required; offline; high quality |
+| `espeak` | espeak-ng local TTS | Fallback; lower quality; always available |
+| `openai_tts` | OpenAI TTS API (`/v1/audio/speech`) | High quality; requires `OPENAI_API_KEY` |
+| `chat_completions_tts` | OpenAI-compatible chat completions TTS output | Multimodal models with audio output |
+
+### Configuration
+
+Set `SANDBOX_POLICY=audio_access` (or `audioaccess`, `audio`) to enable.
+The image defaults to `ironclaw-audio:latest`; override with `AUDIO_IMAGE=my-audio-image`.
+
+Build the image:
+```bash
+docker build -f ironclaw/docker/audio-sandbox.Dockerfile -t ironclaw-audio:latest ironclaw/
+```
+
+### New Files (Audio I/O)
+
+#### IronClaw — Audio Sandbox Core
+
+| File | Purpose |
+|------|---------|
+| [`ironclaw/src/sandbox/audio.rs`](../ironclaw/src/sandbox/audio.rs) | `AudioSandboxManager` — manages the audio container lifecycle. Methods: `start_session(consent)` (consent gate), `stop_session`, `record_audio(duration_secs)` (returns base64 WAV), `transcribe_audio(audio_b64)` (returns `TranscriptResult`), `record_and_transcribe(duration_secs)` (convenience), `speak(text, voice)` (returns `TtsResult`), `status()`. `AudioSandboxConfig` with defaults. `AudioError` enum. |
+| [`ironclaw/src/sandbox/config.rs`](../ironclaw/src/sandbox/config.rs) | **(Audio)** Added `SandboxPolicy::AudioAccess` variant with full doc comment (security properties, residual risks, consent gate). Updated `allows_writes()`, `writable_path()` (returns `/audio-workspace`), `FromStr`. Added `is_audio_access()`. |
+| [`ironclaw/src/sandbox/mod.rs`](../ironclaw/src/sandbox/mod.rs) | **(Audio)** Added `pub mod audio`. Re-exports for `AudioError`, `AudioExecOutput`, `AudioResult`, `AudioSandboxConfig`, `AudioSandboxManager`, `TranscriptResult`, `TtsResult`. |
+
+#### IronClaw — Audio Tools
+
+| File | Purpose |
+|------|---------|
+| [`ironclaw/src/tools/builtin/audio.rs`](../ironclaw/src/tools/builtin/audio.rs) | Seven audio tools, all holding `Arc<AudioSandboxManager>`: `AudioSessionStartTool` (`ApprovalRequirement::Always` — consent gate), `AudioSessionStopTool`, `AudioRecordTool` (returns base64 WAV), `AudioTranscribeTool` (STT, `ApprovalRequirement::Never`), `AudioListenTool` (record + transcribe), `AudioSpeakTool` (TTS, max 4096 chars), `AudioStatusTool` (`ApprovalRequirement::Never`). `build_audio_tools(manager)` convenience builder. |
+| [`ironclaw/src/tools/builtin/mod.rs`](../ironclaw/src/tools/builtin/mod.rs) | **(Audio)** Added `pub mod audio`. Re-exports for all 7 audio tool structs and `build_audio_tools`. |
+
+#### IronClaw — Audio Container Image
+
+| File | Purpose |
+|------|---------|
+| [`ironclaw/docker/audio-sandbox.Dockerfile`](../ironclaw/docker/audio-sandbox.Dockerfile) | Multi-stage image. Stage 1: Build whisper.cpp (CPU-only, base + tiny models). Stage 2: Download Piper binary + en_US-lessac-medium voice. Stage 3: Final image — Ubuntu 24.04, PulseAudio, sox, ffmpeg, espeak-ng, Python venv (openai, requests). Non-root UID 1000 (`worker`). Read-only rootfs, tmpfs `/tmp` + `/run/pulse`. |
+| [`ironclaw/docker/audio-entrypoint.sh`](../ironclaw/docker/audio-entrypoint.sh) | Container entrypoint. Starts PulseAudio with null sink/source + loopback module. Waits for socket ready. Keeps container alive for `docker exec` commands. Handles SIGTERM/SIGINT for clean shutdown. |
+| [`ironclaw/docker/audio-record.sh`](../ironclaw/docker/audio-record.sh) | Records from PulseAudio virtual source using `parec`, converts to 16kHz mono WAV via `sox`. Duration capped at 120s. Output under `/tmp` only. |
+| [`ironclaw/docker/audio-transcribe.sh`](../ironclaw/docker/audio-transcribe.sh) | Transcribes WAV to JSON using whisper.cpp (local) or delegates to `audio-transcribe-api.py` (API). Output: `{"text": "...", "language": "en", "confidence": null, "backend": "..."}`. |
+| [`ironclaw/docker/audio-speak.sh`](../ironclaw/docker/audio-speak.sh) | Synthesizes speech using Piper (local), espeak-ng (fallback), or delegates to `audio-speak-api.py` (API). Plays through PulseAudio virtual sink. |
+| [`ironclaw/docker/audio-transcribe-api.py`](../ironclaw/docker/audio-transcribe-api.py) | Python script for API-based STT. Backends: `whisper_api` (OpenAI `/v1/audio/transcriptions`), `chat_completions` (multimodal). API keys from env only. |
+| [`ironclaw/docker/audio-speak-api.py`](../ironclaw/docker/audio-speak-api.py) | Python script for API-based TTS. Backends: `openai_tts` (OpenAI `/v1/audio/speech`), `chat_completions_tts` (multimodal audio output). API keys from env only. |
+
+#### IronClaw — Audio Config
+
+| File | Purpose |
+|------|---------|
+| [`ironclaw/src/config/audio.rs`](../ironclaw/src/config/audio.rs) | `AudioConfig` — resolves all audio env vars with typed defaults. Validates STT/TTS backend names, Whisper model sizes, base URLs (SSRF prevention). `to_sandbox_config()` builds `AudioSandboxConfig`. |
+| [`ironclaw/src/settings.rs`](../ironclaw/src/settings.rs) | **(Audio)** Added `AudioSettings { enabled: bool }` struct and `audio: Option<AudioSettings>` field to `Settings`. |
+| [`ironclaw/src/config/mod.rs`](../ironclaw/src/config/mod.rs) | **(Audio)** Added `mod audio` and `pub use self::audio::AudioConfig`. |
+
+#### IronClaw — Audio Tests
+
+| File | What It Tests |
+|------|--------------|
+| [`ironclaw/tests/audio_sandbox_integration.rs`](../ironclaw/tests/audio_sandbox_integration.rs) | `SandboxPolicy::AudioAccess` properties (is_audio_access, allows_writes, writable_path, FromStr), `AudioSandboxConfig` defaults, consent gate enforcement (consent=false → ConsentRequired), input validation (zero/excessive duration, empty/long text), idempotent stop, `AudioError` display, `build_audio_tools` returns 7 tools with correct names, approval requirements. |
+
+### Configuration Reference (Audio)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUDIO_ENABLED` | `false` | Enable audio I/O tools |
+| `AUDIO_STT_BACKEND` | `whisper_local` | STT backend: `whisper_local`, `whisper_api`, `chat_completions` |
+| `AUDIO_TTS_BACKEND` | `piper` | TTS backend: `piper`, `espeak`, `openai_tts`, `chat_completions_tts` |
+| `AUDIO_WHISPER_MODEL` | `base` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large` |
+| `AUDIO_PIPER_VOICE` | `en_US-lessac-medium` | Piper voice name (must match a downloaded `.onnx` model) |
+| `AUDIO_STT_MODEL` | `whisper-1` | API STT model name (for `whisper_api` / `chat_completions`) |
+| `AUDIO_TTS_MODEL` | `tts-1` | API TTS model name (for `openai_tts` / `chat_completions_tts`) |
+| `AUDIO_TTS_VOICE` | `alloy` | API TTS voice: `alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer` |
+| `AUDIO_STT_BASE_URL` | — | Base URL for STT API (overrides `LLM_BASE_URL`; SSRF-validated) |
+| `AUDIO_TTS_BASE_URL` | — | Base URL for TTS API (overrides `LLM_BASE_URL`; SSRF-validated) |
+| `AUDIO_MAX_RECORD_SECS` | `120` | Maximum recording duration in seconds (1–600) |
+| `AUDIO_MAX_TTS_CHARS` | `4096` | Maximum TTS text length in characters (1–32768) |
+| `AUDIO_MEMORY_LIMIT_MB` | `2048` | Container memory limit in MB |
+| `AUDIO_IMAGE` | `ironclaw-audio:latest` | Docker image for audio sandbox |
+| `AUDIO_REQUIRE_CONSENT` | `true` | Require explicit user consent (env-only; never from DB) |
+
+### Quick Start (Audio)
+
+```bash
+# 1. Build the audio sandbox image
+docker build -f ironclaw/docker/audio-sandbox.Dockerfile \
+             -t ironclaw-audio:latest ironclaw/
+
+# 2. Enable audio I/O (local STT + TTS, no API key required)
+export AUDIO_ENABLED=true
+export AUDIO_STT_BACKEND=whisper_local
+export AUDIO_TTS_BACKEND=piper
+export SANDBOX_POLICY=audio_access
+
+# 3. Run IronClaw — audio tools are now available
+ironclaw
+
+# 4. In a conversation, the AI can now:
+#    - Call audio_session_start(consent=true) to start a session
+#    - Call audio_listen(duration_secs=5) to hear a voice command
+#    - Call audio_speak(text="Hello! How can I help you?") to respond
+```
+
+**With OpenAI API (higher quality):**
+```bash
+export AUDIO_ENABLED=true
+export AUDIO_STT_BACKEND=whisper_api
+export AUDIO_TTS_BACKEND=openai_tts
+export OPENAI_API_KEY=<your-key>
+export SANDBOX_POLICY=audio_access
+ironclaw
+```
+
+### Running Audio Tests
+
+```bash
+cd ironclaw
+cargo test audio_sandbox_integration
+```

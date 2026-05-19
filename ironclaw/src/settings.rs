@@ -297,6 +297,10 @@ pub struct Settings {
     #[serde(default)]
     pub transcription: Option<TranscriptionSettings>,
 
+    /// Audio I/O configuration (STT + TTS).
+    #[serde(default)]
+    pub audio: Option<AudioSettings>,
+
     /// Per-tool permission overrides.
     ///
     /// Keys are tool names; persisted values are authoritative. Absent tools
@@ -1115,6 +1119,17 @@ pub struct MissionSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptionSettings {
     /// Whether audio transcription is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Audio I/O settings (persisted in DB / TOML).
+///
+/// Only the `enabled` flag is stored here; all other audio settings are
+/// resolved from environment variables by [`AudioConfig::resolve`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioSettings {
+    /// Whether audio I/O tools (STT + TTS) are enabled.
     #[serde(default)]
     pub enabled: bool,
 }

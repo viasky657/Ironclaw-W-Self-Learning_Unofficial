@@ -20,6 +20,7 @@
 
 pub mod acp;
 mod agent;
+mod audio;
 mod builder;
 mod channels;
 mod database;
@@ -50,6 +51,7 @@ use crate::error::ConfigError;
 use crate::settings::Settings;
 
 // Re-export all public types so `crate::config::FooConfig` continues to work.
+pub use self::audio::AudioConfig;
 pub use self::agent::AgentConfig;
 pub use self::builder::BuilderModeConfig;
 pub use self::channels::{

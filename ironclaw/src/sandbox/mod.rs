@@ -85,6 +85,7 @@
 //! - **Auto-cleanup**: Containers are removed after execution (--rm + explicit cleanup)
 //! - **Timeout enforcement**: Commands are killed after the timeout
 
+pub mod audio;
 pub mod config;
 pub mod container;
 pub mod credential_zones;
@@ -94,6 +95,10 @@ pub mod error;
 pub mod manager;
 pub mod proxy;
 
+pub use audio::{
+    AudioError, AudioExecOutput, AudioResult, AudioSandboxConfig, AudioSandboxManager,
+    TranscriptResult, TtsResult,
+};
 pub use config::{ResourceLimits, SandboxConfig, SandboxPolicy};
 pub use container::{ContainerOutput, ContainerRunner, connect_docker};
 pub use credential_zones::{
